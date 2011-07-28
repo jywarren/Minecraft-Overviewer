@@ -272,8 +272,9 @@ var overviewer = {
                     if (item.type == 'spawn') { 
                         // don't filter spawn, always display
                         var marker = new google.maps.Marker({
-                            'position': overviewer.util.fromWorldToLatLng(item.x,
-                                item.y, item.z),
+                            'position': overviewer.util.fromWorldToLatLng( item.x-overviewerConfig.map.center[0],
+                            						   item.y-overviewerConfig.map.center[1], 
+									   item.z-overviewerConfig.map.center[2]),
                              'map':     overviewer.map,
                              'title':   jQuery.trim(item.msg),
                              'icon':    overviewerConfig.CONST.image.spawnMarker
@@ -912,8 +913,10 @@ var overviewer = {
           hard_permalink = true;
         }
       }
+      overviewer.backcount -= 1;
       location.hash = "#/"+overviewer.map.getCenter().lat().toFixed(3)+"/"+overviewer.map.getCenter().lng().toFixed(3)+"/"+overviewer.map.getZoom();
     },
+    backcount: -1,
     permalinks: {
       "rent": {
         text: "Rent is $200/month jeff@ unterbahn.com",
@@ -952,5 +955,5 @@ var overviewer = {
          mapOptions = overviewer.readHash();
          if (overviewer.map) overviewer.map.setCenter(new google.maps.LatLng(mapOptions.lat, mapOptions.lng))
          if (overviewer.map) overviewer.map.setZoom(mapOptions.zoom)
-     }
+    }
 };
