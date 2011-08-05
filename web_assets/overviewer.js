@@ -60,7 +60,7 @@ var overviewer = {
             overviewer.util.createMapControls();
             //window.addEventListener("hashchange",overviewer.goToHash,false);
             //window.onhashchange = overviewer.goToHash;
-            setInterval(overviewer.goToHash,500);
+            //setInterval(overviewer.goToHash,500);
         },
         /**
          * This adds some methods to these classes because Javascript is stupid
@@ -272,9 +272,8 @@ var overviewer = {
                     if (item.type == 'spawn') { 
                         // don't filter spawn, always display
                         var marker = new google.maps.Marker({
-                            'position': overviewer.util.fromWorldToLatLng( item.x-overviewerConfig.map.center[0],
-                            						   item.y-overviewerConfig.map.center[1], 
-									   item.z-overviewerConfig.map.center[2]),
+                            'position': overviewer.util.fromWorldToLatLng(item.x,
+                                item.y, item.z),
                              'map':     overviewer.map,
                              'title':   jQuery.trim(item.msg),
                              'icon':    overviewerConfig.CONST.image.spawnMarker
@@ -936,6 +935,7 @@ var overviewer = {
        }
     },
     readHash: function(mapOptions) {
+	console.log('readHash')
          mapOptions = mapOptions || {}
          var hash = window.location.hash
          var params = hash.split("/")
