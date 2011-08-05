@@ -935,7 +935,6 @@ var overviewer = {
        }
     },
     readHash: function(mapOptions) {
-	console.log('readHash')
          mapOptions = mapOptions || {}
          var hash = window.location.hash
          var params = hash.split("/")
