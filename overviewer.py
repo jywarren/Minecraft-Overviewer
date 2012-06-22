@@ -15,254 +15,461 @@
 #    You should have received a copy of the GNU General Public License along
 #    with the Overviewer.  If not, see <http://www.gnu.org/licenses/>.
 
+import platform
 import sys
+
+# quick version check
 if not (sys.version_info[0] == 2 and sys.version_info[1] >= 6):
-    print "Sorry, the Overviewer requires at least Python 2.6 to run"  # Python3.0 is not supported either
+    print "Sorry, the Overviewer requires at least Python 2.6 to run"
+    if sys.version_info[0] >= 3:
+        print "and will not run on Python 3.0 or later"
     sys.exit(1)
 
 import os
 import os.path
-from configParser import ConfigOptionParser
 import re
 import subprocess
 import multiprocessing
 import time
 import logging
-import util
-import platform
+from optparse import OptionParser, OptionGroup
 
-logging.basicConfig(level=logging.INFO,format="%(asctime)s [%(levelname)s] %(message)s")
-
-this_dir = util.get_program_path()
-
-# make sure the c_overviewer extension is available
-try:
-    import c_overviewer
-except ImportError:
-    ## try to find the build extension
-    ext = os.path.join(this_dir, "c_overviewer.%s" % ("pyd" if platform.system() == "Windows" else "so"))
-    if os.path.exists(ext):
-        print "Something has gone wrong importing the c_overviewer extension.  Please"
-        print "make sure it is up-to-date (clean and rebuild)"
-        sys.exit(1)
-
-    print "You need to compile the c_overviewer module to run Minecraft Overviewer."
-    print "Run `python setup.py build`, or see the README for details."
-    sys.exit(1)
-
-if hasattr(sys, "frozen"):
-    pass # we don't bother with a compat test since it should always be in sync
-elif "extension_version" in dir(c_overviewer):
-    # check to make sure the binary matches the headers
-    if os.path.exists(os.path.join(this_dir, "src", "overviewer.h")):
-        with open(os.path.join(this_dir, "src", "overviewer.h")) as f:
-            lines = f.readlines()
-            lines = filter(lambda x: x.startswith("#define OVERVIEWER_EXTENSION_VERSION"), lines)
-            if lines:
-                l = lines[0]
-                if int(l.split()[2].strip()) != c_overviewer.extension_version():
-                    print "Please rebuild your c_overviewer module.  It is out of date!"
-                    sys.exit(1)
-else:
-    print "Please rebuild your c_overviewer module.  It is out of date!"
-    sys.exit(1)
-
-
-import optimizeimages
-import world
-import quadtree
-import googlemap
-import rendernode
+from overviewer_core import util
+from overviewer_core import logger
+from overviewer_core import textures
+from overviewer_core import optimizeimages, world
+from overviewer_core import configParser, tileset, assetmanager, dispatcher
+from overviewer_core import cache
+from overviewer_core import observer
 
 helptext = """
-%prog [OPTIONS] <World # / Name / Path to World> <tiles dest dir>
-%prog -d <World # / Name / Path to World / Path to cache dir> [tiles dest dir]"""
-
-
+%prog [--rendermodes=...] [options] <World> <Output Dir>
+%prog --config=<config file> [options]"""
 
 def main():
+    # bootstrap the logger with defaults
+    logger.configure()
+
     try:
         cpus = multiprocessing.cpu_count()
     except NotImplementedError:
         cpus = 1
-    
-    avail_rendermodes = c_overviewer.get_render_modes()
-    
-    parser = ConfigOptionParser(usage=helptext, config="settings.py")
-    parser.add_option("-V", "--version", dest="version", help="Displays version information and then exits", action="store_true")
-    parser.add_option("-p", "--processes", dest="procs", help="How many worker processes to start. Default %s" % cpus, default=cpus, action="store", type="int")
-    parser.add_option("-z", "--zoom", dest="zoom", help="Sets the zoom level manually instead of calculating it. This can be useful if you have outlier chunks that make your world too big. This value will make the highest zoom level contain (2**ZOOM)^2 tiles", action="store", type="int", configFileOnly=True)
-    parser.add_option("-d", "--delete", dest="delete", help="Clear all caches. Next time you render your world, it will have to start completely over again. This is probably not a good idea for large worlds. Use this if you change texture packs and want to re-render everything.", action="store_true", commandLineOnly=True)
-    parser.add_option("--chunklist", dest="chunklist", help="A file containing, on each line, a path to a chunkfile to update. Instead of scanning the world directory for chunks, it will just use this list. Normal caching rules still apply.")
-    parser.add_option("--rendermodes", dest="rendermode", help="Specifies the render types, separated by commas. Use --list-rendermodes to list them all.", type="choice", choices=avail_rendermodes, required=True, default=avail_rendermodes[0], listify=True)
-    parser.add_option("--list-rendermodes", dest="list_rendermodes", action="store_true", help="List available render modes and exit.", commandLineOnly=True)
-    parser.add_option("--imgformat", dest="imgformat", help="The image output format to use. Currently supported: png(default), jpg. NOTE: png will always be used as the intermediate image format.", configFileOnly=True )
-    parser.add_option("--bg_color", dest="bg_color", help="Configures the background color for the GoogleMap output.  Specify in #RRGGBB format", configFileOnly=True, type="string", default="#1A1A1A")
-    parser.add_option("--optimize-img", dest="optimizeimg", help="If using png, perform image file size optimizations on the output. Specify 1 for pngcrush, 2 for pngcrush+optipng+advdef. This may double (or more) render times, but will produce up to 30% smaller images. NOTE: requires corresponding programs in $PATH or %PATH%", configFileOnly=True)
-    parser.add_option("--web-assets-hook", dest="web_assets_hook", help="If provided, run this function after the web assets have been copied, but before actual tile rendering begins. It should accept a QuadtreeGen object as its only argument.", action="store", metavar="SCRIPT", type="function", configFileOnly=True)
-    parser.add_option("-q", "--quiet", dest="quiet", action="count", default=0, help="Print less output. You can specify this option multiple times.")
-    parser.add_option("-v", "--verbose", dest="verbose", action="count", default=0, help="Print more output. You can specify this option multiple times.")
-    parser.add_option("--skip-js", dest="skipjs", action="store_true", help="Don't output marker.js or regions.js")
-    parser.add_option("--display-config", dest="display_config", action="store_true", help="Display the configuration parameters, but don't render the map.  Requires all required options to be specified", commandLineOnly=True)
-    #parser.add_option("--write-config", dest="write_config", action="store_true", help="Writes out a sample config file", commandLineOnly=True)
+
+    #avail_rendermodes = c_overviewer.get_render_modes()
+    avail_north_dirs = ['lower-left', 'upper-left', 'upper-right', 'lower-right', 'auto']
+
+    # Parse for basic options
+    parser = OptionParser(usage=helptext, add_help_option=False)
+    parser.add_option("-h", "--help", dest="help", action="store_true",
+            help="show this help message and exit")
+    parser.add_option("--config", dest="config", action="store", help="Specify the config file to use.")
+    parser.add_option("-p", "--processes", dest="procs", action="store", type="int",
+            help="The number of local worker processes to spawn. Defaults to the number of CPU cores your computer has")
+
+    # Options that only apply to the config-less render usage
+    parser.add_option("--rendermodes", dest="rendermodes", action="store",
+            help="If you're not using a config file, specify which rendermodes to render with this option. This is a comma-separated list.")
+
+    # Useful one-time render modifiers:
+    parser.add_option("--forcerender", dest="forcerender", action="store_true",
+            help="Force re-rendering the entire map.")
+    parser.add_option("--check-tiles", dest="checktiles", action="store_true",
+            help="Check each tile on disk and re-render old tiles")
+    parser.add_option("--no-tile-checks", dest="notilechecks", action="store_true",
+            help="Only render tiles that come from chunks that have changed since the last render (the default)")
+
+    # Useful one-time debugging options:
+    parser.add_option("--check-terrain", dest="check_terrain", action="store_true",
+            help="Prints the location and hash of terrain.png, useful for debugging terrain.png problems")
+    parser.add_option("-V", "--version", dest="version",
+            help="Displays version information and then exits", action="store_true")
+
+    # Log level options:
+    parser.add_option("-q", "--quiet", dest="quiet", action="count", default=0,
+            help="Print less output. You can specify this option multiple times.")
+    parser.add_option("-v", "--verbose", dest="verbose", action="count", default=0,
+            help="Print more output. You can specify this option multiple times.")
+    parser.add_option("--simple-output", dest="simple", action="store_true", default=False,
+            help="Use a simple output format, with no colors or progress bars")
+
+    # create a group for "plugin exes" (the concept of a plugin exe is only loosly defined at this point)
+    exegroup = OptionGroup(parser, "Other Scripts",
+            "These scripts may accept different arguments than the ones listed above")
+    exegroup.add_option("--genpoi", dest="genpoi", action="store_true",
+            help="Runs the genPOI script")
+
+    parser.add_option_group(exegroup)
 
     options, args = parser.parse_args()
 
-
-    if options.version:
-        print "Minecraft-Overviewer"
-        print "Git version: %s" % util.findGitVersion()
-        try:
-            import overviewer_version
-            if hasattr(sys, "frozen"):
-                print "py2exe version build on %s" % overviewer_version.BUILD_DATE
-                print "Build machine: %s %s" % (overviewer_version.BUILD_PLATFORM, overviewer_version.BUILD_OS)
-        except:
-            pass
-        sys.exit(0)
-    
-    if options.list_rendermodes:
-        rendermode_info = map(c_overviewer.get_render_mode_info, avail_rendermodes)
-        name_width = max(map(lambda i: len(i['name']), rendermode_info))
-        for info in rendermode_info:
-            print "{name:{0}} {description}".format(name_width, **info)
-        sys.exit(0)
-
-    if len(args) < 1:
-        logging.error("You need to give me your world number or directory")
+    # first thing to do is check for stuff in the exegroup:
+    if options.genpoi:
+        # remove the "--genpoi" option from sys.argv before running genPI
+        sys.argv.remove("--genpoi")
+        #sys.path.append(".")
+        g = __import__("overviewer_core.aux_files", {}, {}, ["genPOI"])
+        g.genPOI.main()
+        return 0
+    if options.help:
         parser.print_help()
-        list_worlds()
-        sys.exit(1)
-    worlddir = args[0]
+        return 0
 
-    if not os.path.exists(worlddir):
-        # world given is either world number, or name
-        worlds = world.get_worlds()
-        
-        # if there are no worlds found at all, exit now
-        if not worlds:
-            parser.print_help()
-            logging.error("Invalid world path")
-            sys.exit(1)
-        
+    # re-configure the logger now that we've processed the command line options
+    logger.configure(logging.INFO + 10*options.quiet - 10*options.verbose,
+                     verbose=options.verbose > 0,
+                     simple=options.simple)
+
+    ##########################################################################
+    # This section of main() runs in response to any one-time options we have,
+    # such as -V for version reporting
+    if options.version:
+        print "Minecraft Overviewer %s" % util.findGitVersion(),
+        print "(%s)" % util.findGitHash()[:7]
         try:
-            worldnum = int(worlddir)
-            worlddir = worlds[worldnum]['path']
-        except ValueError:
-            # it wasn't a number or path, try using it as a name
-            try:
-                worlddir = worlds[worlddir]['path']
-            except KeyError:
-                # it's not a number, name, or path
-                parser.print_help()
-                logging.error("Invalid world name or path")
-                sys.exit(1)
-        except KeyError:
-            # it was an invalid number
-            parser.print_help()
-            logging.error("Invalid world number")
-            sys.exit(1)
+            import overviewer_core.overviewer_version as overviewer_version
+            print "built on %s" % overviewer_version.BUILD_DATE
+            if options.verbose > 0:
+                print "Build machine: %s %s" % (overviewer_version.BUILD_PLATFORM, overviewer_version.BUILD_OS)
+        except ImportError:
+            print "(build info not found)"
+        return 0
 
-    if len(args) != 2:
-        if options.delete:
-            return delete_all(worlddir, None)
-        parser.error("Where do you want to save the tiles?")
+    if options.check_terrain:
+        import hashlib
+        from overviewer_core.textures import Textures
+        # TODO custom textures path?
+        tex = Textures()
 
-    destdir = args[1]
-    if options.display_config:
-        # just display the config file and exit
-        parser.display_config()
-        sys.exit(0)
+        try:
+            f = tex.find_file("terrain.png", verbose=True)
+        except IOError:
+            logging.error("Could not find the file terrain.png")
+            return 1
 
+        h = hashlib.sha1()
+        h.update(f.read())
+        logging.info("Hash of terrain.png file is: `%s`", h.hexdigest())
+        return 0
 
-    if options.delete:
-        return delete_all(worlddir, destdir)
-
-    if options.chunklist:
-        chunklist = open(options.chunklist, 'r')
-    else:
-        chunklist = None
-
-    if options.imgformat:
-        if options.imgformat not in ('jpg','png'):
-            parser.error("Unknown imgformat!")
+    # if no arguments are provided, print out a helpful message
+    if len(args) == 0 and not options.config:
+        # first provide an appropriate error for bare-console users
+        # that don't provide any options
+        if util.is_bare_console():
+            print "\n"
+            print "The Overviewer is a console program.  Please open a Windows command prompt"
+            print "first and run Overviewer from there.   Further documentation is available at"
+            print "http://docs.overviewer.org/\n"
         else:
-            imgformat = options.imgformat
-    else:
-        imgformat = 'png'
+            # more helpful message for users who know what they're doing
+            logging.error("You must either specify --config or give me a world directory and output directory")
+            parser.print_help()
+            list_worlds()
+        return 1
 
-    if options.optimizeimg:
-        optimizeimg = int(options.optimizeimg)
-        optimizeimages.check_programs(optimizeimg)
-    else:
-        optimizeimg = None
-    
-    logging.getLogger().setLevel(
-        logging.getLogger().level + 10*options.quiet)
-    logging.getLogger().setLevel(
-        logging.getLogger().level - 10*options.verbose)
+    ##########################################################################
+    # This section does some sanity checking on the command line options passed
+    # in. It checks to see if --config was given that no worldname/destdir were
+    # given, and vice versa
+    if options.config and args:
+        print
+        print "If you specify --config, you need to specify the world to render as well as"
+        print "the destination in the config file, not on the command line."
+        print "Put something like this in your config file:"
+        print "worlds['myworld'] = %r" % args[0]
+        print "outputdir = %r" % (args[1] if len(args) > 1 else "/path/to/output")
+        print
+        logging.error("Cannot specify both --config AND a world + output directory on the command line.")
+        parser.print_help()
+        return 1
 
+    if not options.config and len(args) < 2:
+        logging.error("You must specify both the world directory and an output directory")
+        parser.print_help()
+        return 1
+    if not options.config and len(args) > 2:
+        # it's possible the user has a space in one of their paths but didn't
+        # properly escape it attempt to detect this case
+        for start in range(len(args)):
+            if not os.path.exists(args[start]):
+                for end in range(start+1, len(args)+1):
+                    if os.path.exists(" ".join(args[start:end])):
+                        logging.warning("It looks like you meant to specify \"%s\" as your world dir or your output\n\
+dir but you forgot to put quotes around the directory, since it contains spaces." % " ".join(args[start:end]))
+                        return 1
+        logging.error("Too many command line arguments")
+        parser.print_help()
+        return 1
+
+    #########################################################################
+    # These two halfs of this if statement unify config-file mode and
+    # command-line mode.
+    mw_parser = configParser.MultiWorldParser()
+
+    if not options.config:
+        # No config file mode.
+        worldpath, destdir = map(os.path.expanduser, args)
+        logging.debug("Using %r as the world directory", worldpath)
+        logging.debug("Using %r as the output directory", destdir)
+
+        mw_parser.set_config_item("worlds", {'world': worldpath})
+        mw_parser.set_config_item("outputdir", destdir)
+
+        rendermodes = ['lighting']
+        if options.rendermodes:
+            rendermodes = options.rendermodes.replace("-","_").split(",")
+
+        # Now for some good defaults
+        renders = util.OrderedDict()
+        for rm in rendermodes:
+            renders["world-" + rm] = {
+                    "world": "world",
+                    "title": "Overviewer Render (%s)" % rm,
+                    "rendermode": rm,
+                    }
+        mw_parser.set_config_item("renders", renders)
+
+    else:
+        if options.rendermodes:
+            logging.error("You cannot specify --rendermodes if you give a config file. Configure your rendermodes in the config file instead")
+            parser.print_help()
+            return 1
+
+        # Parse the config file
+        mw_parser.parse(options.config)
+
+    # Add in the command options here, perhaps overriding values specified in
+    # the config
+    if options.procs:
+        mw_parser.set_config_item("processes", options.procs)
+
+    # Now parse and return the validated config
+    try:
+        config = mw_parser.get_validated_config()
+    except Exception as ex:
+        if options.verbose:
+            logging.exception("An error was encountered with your configuration. See the info below.")
+        else: # no need to print scary traceback! just
+            logging.error("An error was encountered with your configuration.")
+            logging.error(str(ex))
+        return 1
+
+
+
+    ############################################################
+    # Final validation steps and creation of the destination directory
     logging.info("Welcome to Minecraft Overviewer!")
     logging.debug("Current log level: {0}".format(logging.getLogger().level))
-   
-    useBiomeData = os.path.exists(os.path.join(worlddir, 'biomes'))
-    if not useBiomeData:
-        logging.info("Notice: Not using biome data for tinting")
-    
-    # First do world-level preprocessing
-    w = world.World(worlddir, useBiomeData=useBiomeData)
-    w.go(options.procs)
 
-    logging.info("Rending the following tilesets: %s", ",".join(options.rendermode))
+    # Override some render configdict options depending on one-time command line
+    # modifiers
+    if (
+            bool(options.forcerender) +
+            bool(options.checktiles) +
+            bool(options.notilechecks)
+            ) > 1:
+        logging.error("You cannot specify more than one of --forcerender, "+
+        "--check-tiles, and --no-tile-checks. These options conflict.")
+        parser.print_help()
+        return 1
+    if options.forcerender:
+        logging.info("Forcerender mode activated. ALL tiles will be rendered")
+        for render in config['renders'].itervalues():
+            render['renderchecks'] = 2
+    elif options.checktiles:
+        logging.info("Checking all tiles for updates manually.")
+        for render in config['renders'].itervalues():
+            render['renderchecks'] = 1
+    elif options.notilechecks:
+        logging.info("Disabling all tile mtime checks. Only rendering tiles "+
+        "that need updating since last render")
+        for render in config['renders'].itervalues():
+            render['renderchecks'] = 0
 
-    bgcolor = (int(options.bg_color[1:3],16), int(options.bg_color[3:5],16), int(options.bg_color[5:7],16), 0)
+    if not config['renders']:
+        logging.error("You must specify at least one render in your config file. See the docs if you're having trouble")
+        return 1
 
-    # create the quadtrees
-    # TODO chunklist
-    q = []
-    qtree_args = {'depth' : options.zoom, 'imgformat' : imgformat, 'optimizeimg' : optimizeimg, 'bgcolor':bgcolor}
-    for rendermode in options.rendermode:
-        if rendermode == 'normal':
-            qtree = quadtree.QuadtreeGen(w, destdir, rendermode=rendermode, tiledir='tiles', **qtree_args)
+    #####################
+    # Do a few last minute things to each render dictionary here
+    for rname, render in config['renders'].iteritems():
+        # Convert render['world'] to the world path, and store the original
+        # in render['worldname_orig']
+        try:
+            worldpath = config['worlds'][render['world']]
+        except KeyError:
+            logging.error("Render %s's world is '%s', but I could not find a corresponding entry in the worlds dictionary.",
+                    rname, render['world'])
+            return 1
+        render['worldname_orig'] = render['world']
+        render['world'] = worldpath
+
+        # If 'forcerender' is set, change renderchecks to 2
+        if render.get('forcerender', False):
+            render['renderchecks'] = 2
+
+        # check if overlays are set, if so, make sure that those renders exist
+        if render.get('overlay', []) != []:
+            for x in render.get('overlay'):
+                if x != rname:
+                    try:
+                        renderLink = config['renders'][x]
+                    except KeyError:
+                        logging.error("Render %s's overlay is '%s', but I could not find a corresponding entry in the renders dictionary.",
+                                rname, x)
+                        return 1
+                else:
+                    logging.error("Render %s's overlay contains itself.", rname)
+                    return 1
+
+    destdir = config['outputdir']
+    if not destdir:
+        logging.error("You must specify the output directory in your config file.")
+        logging.error("e.g. outputdir = '/path/to/outputdir'")
+        return 1
+    if not os.path.exists(destdir):
+        try:
+            os.mkdir(destdir)
+        except OSError:
+            logging.exception("Could not create the output directory.")
+            return 1
+
+    # The changelist support.
+    changelists = {}
+    for render in config['renders'].itervalues():
+        if 'changelist' in render:
+            path = render['changelist']
+            if path not in changelists:
+                out = open(path, "w")
+                logging.debug("Opening changelist %s (%s)", out, out.fileno())
+                changelists[path] = out
+            else:
+                out = changelists[path]
+            render['changelist'] = out.fileno()
+
+
+    ########################################################################
+    # Now we start the actual processing, now that all the configuration has
+    # been gathered and validated
+    # create our asset manager... ASSMAN
+    assetMrg = assetmanager.AssetManager(destdir)
+
+    tilesets = []
+
+    # saves us from creating the same World object over and over again
+    worldcache = {}
+    # same for textures
+    texcache = {}
+
+    # Set up the cache objects to use
+    caches = []
+    caches.append(cache.LRUCache(size=100))
+    if config.get("memcached_host", False):
+        caches.append(cache.Memcached(config['memcached_host']))
+    # TODO: optionally more caching layers here
+
+    renders = config['renders']
+    for render_name, render in renders.iteritems():
+        logging.debug("Found the following render thing: %r", render)
+
+        # find or create the world object
+        try:
+            w = worldcache[render['world']]
+        except KeyError:
+            w = world.World(render['world'])
+            worldcache[render['world']] = w
+
+        # find or create the textures object
+        texopts = util.dict_subset(render, ["texturepath", "bgcolor", "northdirection"])
+        texopts_key = tuple(texopts.items())
+        if texopts_key not in texcache:
+            tex = textures.Textures(**texopts)
+            tex.generate()
+            texcache[texopts_key] = tex
         else:
-            qtree = quadtree.QuadtreeGen(w, destdir, rendermode=rendermode, **qtree_args)
-        q.append(qtree)
-    
-    # do quadtree-level preprocessing
-    for qtree in q:
-        qtree.go(options.procs)
+            tex = texcache[texopts_key]
 
-    # create the distributed render
-    r = rendernode.RenderNode(q)
-    
-    # write out the map and web assets
-    m = googlemap.MapGen(q, configInfo=options)
-    m.go(options.procs)
-    
-    # render the tiles!
-    r.go(options.procs)
+        rset = w.get_regionset(render['dimension'])
+        if rset == None: # indicates no such dimension was found:
+            logging.error("Sorry, you requested dimension '%s' for %s, but I couldn't find it", render['dimension'], render_name)
+            return 1
 
-    # finish up the map
-    m.finalize()
+        #################
+        # Apply any regionset transformations here
 
+        # Insert a layer of caching above the real regionset. Any world
+        # tranformations will pull from this cache, but their results will not
+        # be cached by this layer. This uses a common pool of caches; each
+        # regionset cache pulls from the same underlying cache object.
+        rset = world.CachedRegionSet(rset, caches)
 
-def delete_all(worlddir, tiledir):
-    # TODO should we delete tiledir here too?
-    
-    # delete the overviewer.dat persistant data file
-    datfile = os.path.join(worlddir,"overviewer.dat")
-    if os.path.exists(datfile):
-        os.unlink(datfile)
-        logging.info("Deleting {0}".format(datfile))
+        # If a crop is requested, wrap the regionset here
+        if "crop" in render:
+            rset = world.CroppedRegionSet(rset, *render['crop'])
+
+        # If this is to be a rotated regionset, wrap it in a RotatedRegionSet
+        # object
+        if (render['northdirection'] > 0):
+            rset = world.RotatedRegionSet(rset, render['northdirection'])
+        logging.debug("Using RegionSet %r", rset)
+
+        ###############################
+        # Do the final prep and create the TileSet object
+
+        # create our TileSet from this RegionSet
+        tileset_dir = os.path.abspath(os.path.join(destdir, render_name))
+
+        # only pass to the TileSet the options it really cares about
+        render['name'] = render_name # perhaps a hack. This is stored here for the asset manager
+        tileSetOpts = util.dict_subset(render, ["name", "imgformat", "renderchecks", "rerenderprob", "bgcolor", "imgquality", "optimizeimg", "rendermode", "worldname_orig", "title", "dimension", "changelist","showspawn", "overlay","base"])
+        tileSetOpts.update({"spawn": w.find_true_spawn()}) # TODO find a better way to do this
+        tset = tileset.TileSet(w, rset, assetMrg, tex, tileSetOpts, tileset_dir)
+        tilesets.append(tset)
+
+    # Do tileset preprocessing here, before we start dispatching jobs
+    for ts in tilesets:
+        ts.do_preprocessing()
+
+    # Output initial static data and configuration
+    assetMrg.initialize(tilesets)
+
+    # multiprocessing dispatcher
+    if config['processes'] == 1:
+        dispatch = dispatcher.Dispatcher()
+    else:
+        dispatch = dispatcher.MultiprocessingDispatcher(
+            local_procs=config['processes'])
+    dispatch.render_all(tilesets, config['observer'])
+    dispatch.close()
+
+    assetMrg.finalize(tilesets)
+
+    for out in changelists.itervalues():
+        logging.debug("Closing %s (%s)", out, out.fileno())
+        out.close()
+
+    if config['processes'] == 1:
+        logging.debug("Final cache stats:")
+        for c in caches:
+            logging.debug("\t%s: %s hits, %s misses", c.__class__.__name__, c.hits, c.misses)
+
+    return 0
 
 def list_worlds():
     "Prints out a brief summary of saves found in the default directory"
-    print 
+    print
     worlds = world.get_worlds()
     if not worlds:
         print 'No world saves found in the usual place'
         return
     print "Detected saves:"
+
+    # get max length of world name
+    worldNameLen = max([len(str(x)) for x in worlds] + [len("World")])
+
+    formatString = "%-" + str(worldNameLen) + "s | %-8s | %-8s | %-16s | %s "
+    print formatString % ("World", "Size", "Playtime", "Modified", "Path")
+    print formatString % ("-"*worldNameLen, "-"*8, "-"*8, '-'*16, '-'*4)
     for name, info in sorted(worlds.iteritems()):
         if isinstance(name, basestring) and name.startswith("World") and len(name) == 6:
             try:
@@ -277,9 +484,17 @@ def list_worlds():
         playtime = info['Time'] / 20
         playstamp = '%d:%02d' % (playtime / 3600, playtime / 60 % 60)
         size = "%.2fMB" % (info['SizeOnDisk'] / 1024. / 1024.)
-        print "World %s: %s Playtime: %s Modified: %s" % (name, size, playstamp, timestamp)
-
+        path = info['path']
+        print formatString % (name, size, playstamp, timestamp, path)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    main()
+    try:
+        ret = main()
+        util.nice_exit(ret)
+    except Exception, e:
+        logging.exception("""An error has occurred. This may be a bug. Please let us know!
+See http://docs.overviewer.org/en/latest/index.html#help
+
+This is the error that occurred:""")
+        util.nice_exit(1)

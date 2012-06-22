@@ -1,5 +1,8 @@
 #!/usr/bin/python
 
+"""Deletes files from the old chunk-based cache"""
+
+
 usage = "python contrib/%prog [OPTIONS] <World # / Name / Path to World>"
 
 description = """
@@ -14,11 +17,11 @@ import sys
 import re
 import os.path
 
-# sys.path wrangling, so we can access Overviewer code
-overviewer_dir = os.path.split(os.path.split(os.path.abspath(__file__))[0])[0]
-sys.path.insert(0, overviewer_dir)
+# incantation to be able to import overviewer_core
+if not hasattr(sys, "frozen"):
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.split(__file__)[0], '..')))
 
-import world
+from overviewer_core import world
 from overviewer import list_worlds
 
 def main():
