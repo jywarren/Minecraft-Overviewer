@@ -360,8 +360,19 @@ overviewer.views.SignControlView = Backbone.View.extend({
             // for each markerSet, check:
             //    if the markerSet isnot part of this tileset, hide all of the markers
             var curMarkerSet = overviewer.mapView.options.currentTileSet.attributes.path;
+            var curMarkerSet = overviewer.mapView.options.currentTileSet.attributes.path;
+            //var curMarkersVis = overviewer.mapView.options.currentTileSet.attributes.visible;
+            var curMarkersVis = true;
             var dataRoot = markers[curMarkerSet];
-            if (!dataRoot) { 
+            if (dataRoot) {
+               for (markerSet in markersDB) {
+                   jQuery.each(markersDB[markerSet].raw, function(i, elem) {
+                      elem.markerObj.setVisible(true);
+                   })
+                   markersDB[markerSet].checked=true;
+                   $("[_mc_groupname=" + markerSet + "]").attr("checked", markersDB[markerSet].checked);
+                }    
+            } else {
                 // this tileset has no signs, so hide all of them
                 for (markerSet in markersDB) {
                     if (markersDB[markerSet].created) {
